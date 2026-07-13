@@ -2,7 +2,6 @@
 
 **Event-driven AWS platform unifying live CRM webhooks, scheduling webhooks, and batch video analytics — validated through a 7-day continuous production run with documented fault-tolerance and idempotency tests.**
 
-
 ---
 
 ## 📋 Overview
@@ -110,8 +109,6 @@ This wasn't a "build it and demo it once" project. Over the 7-day continuous run
 - **Failure-recovery test**: deliberately broke the lead-owner lookup mid-week and documented how the system recovered via SQS retry/DLQ
 - **Idempotency test**: deliberately replayed a duplicate webhook and confirmed no duplicate S3 object or duplicate Slack message resulted
 - **Daily spot-checks** confirmed new leads appeared in `target/` within the expected delay window with zero DLQ accumulation
-
-
 ---
 
 ## 🧩 Key Design Decisions
