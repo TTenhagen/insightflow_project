@@ -11,9 +11,10 @@ Revenue teams lose visibility the moment their CRM, scheduling tool, and marketi
 Unlike a typical batch ELT build, this system is **fully live**. It was required to run continuously, unattended, for **7 consecutive days**, with documented proof that it handles webhook redelivery (idempotency) and component failure (fault tolerance) gracefully — not just a one-time demo.
 
 **The numbers:**
-- **2** live webhook sources (Close CRM, Calendly) + **1** paginated batch API (Wistia)
+- **2** live webhook sources (Close CRM, Calendly) + **1** paginated batch API (Wistia — media stats *and* visitor-level events, each with its own incremental watermark)
 - **10-minute** mandatory SQS delay between lead creation and owner-enrichment lookup
 - **7 days** continuous live run, with deliberately engineered failure-recovery and duplicate-event tests
+- **9** unit tests (signature verification, idempotency, watermark logic) gating every push via GitHub Actions
 - **6** Streamlit dashboards + **1** cross-source correlation view
 
 ---
@@ -49,8 +50,9 @@ Unlike a typical batch ELT build, this system is **fully live**. It was required
 |---|---|---|
 | **Webhook receivers** | API Gateway + Lambda | Real public endpoints for Close and Calendly to POST to |
 | **Async delay** | Amazon SQS (10-min delay queue) | Gives Close time to assign a lead owner before enrichment runs |
-| **State tracking** | DynamoDB | High-water-mark for incremental, paginated Wistia pulls |
+| **State tracking** | DynamoDB | Per-feed high-water-marks for incremental Wistia pulls (media stats + visitor events) and the notification-sent idempotency flag |
 | **Storage** | AWS S3 | Bronze/Silver/Gold, idempotent deterministic key naming |
+| **IaC** | Terraform | Delay queue, DLQ redrive policy, Lambda event source mapping, and DLQ CloudWatch alarm defined as code (`crm/sqs_delay_queue.tf`) |
 | **Fault tolerance** | Step Functions retries, SQS DLQ, CloudWatch Alarms | Named deliverable — diagrammed and tested, not assumed |
 | **Notifications** | Slack incoming webhook | Real-time "New Lead Alert" with 7 enriched fields |
 | **Dashboard** | Streamlit | 6 Calendly-specific pages + 1 cross-source correlation view |
@@ -66,10 +68,10 @@ Unlike a typical batch ELT build, this system is **fully live**. It was required
 4. After 10 minutes, SQS releases the message → **Lambda B**
 5. Lambda B fetches `https://dea-lead-owner.s3.../{lead_id}.json` — handles "not yet assigned" (404) by letting SQS retry
 6. Lambda B merges CRM event + lead owner data → writes to `crm/target/crm_enriched_{lead_id}.json`
-7. **Lambda C** (S3-triggered) posts a Slack "New Lead Alert" with all 7 required fields
+7. **Lambda C** (S3-triggered) atomically claims a notification flag in DynamoDB (conditional write on `lead_id`), then posts a Slack "New Lead Alert" with all 7 required fields
 8. Any failure routes to a dead-letter queue with a CloudWatch alarm
 
-**Idempotency:** every S3 write uses a deterministic key (`crm_event_{lead_id}.json`) — webhook redelivery overwrites rather than duplicates, and a duplicate-event test was run and documented during the 7-day live window to prove this.
+**Idempotency (two layers):** every S3 write uses a deterministic key (`crm_event_{lead_id}.json`) so webhook redelivery overwrites rather than duplicates, and the Slack notification is guarded by a DynamoDB conditional write — a replayed S3 event can never fire a second alert for the same lead. Both behaviors were tested and documented during the 7-day live window.
 
 ---
 
@@ -79,6 +81,15 @@ Unlike a typical batch ELT build, this system is **fully live**. It was required
 2. Receiver verifies the `Calendly-Webhook-Signature` header (`t=<timestamp>,v1=<hmac>` format — different scheme from Close's), filters out any non-`invitee.created` event types, and writes the raw payload to `calendly/bronze/invitee_created_{booking_id}.json`
 3. A scheduled Glue job flattens the nested Bronze JSON into Silver — extracting `booking_id`, `booking_date`, UTM fields, and mapping the `event_type` URI to a channel name (`facebook_paid_ads`, `youtube_paid_ads`, `tiktok_paid_ads`) via a static lookup
 4. A daily job pulls the previous day's ad spend file (checking `file_index.json` first to confirm it's published) and joins it to Silver bookings on `date` + `channel` to compute Cost Per Booking in Gold
+
+---
+
+## 🎬 The Wistia Flow — Batch, Paginated, Incremental
+
+1. An EventBridge-scheduled Lambda pulls **two feeds** per media ID: media-level stats and visitor-level events — each with its **own DynamoDB watermark** (`media_id` vs `media_id#events`) so the feeds advance independently
+2. Pagination loops until a short page; watermarks only advance after a confirmed S3 write, so a partial run never skips data
+3. A Glue job flattens Bronze into two Silver tables — `media_metrics_cleaned` (media grain) and `visitor_events_cleaned` (event grain) — kept separate because different grains never share a table
+4. Gold builds `engagement_summary` (per media) and `daily_plays` (per date), the latter feeding the cross-source dashboard alongside `daily_lead_counts` (CRM) and `daily_bookings` (Calendly), all built by `cross_source/build_daily_gold.py`
 
 ---
 
@@ -109,6 +120,9 @@ This wasn't a "build it and demo it once" project. Over the 7-day continuous run
 - **Failure-recovery test**: deliberately broke the lead-owner lookup mid-week and documented how the system recovered via SQS retry/DLQ
 - **Idempotency test**: deliberately replayed a duplicate webhook and confirmed no duplicate S3 object or duplicate Slack message resulted
 - **Daily spot-checks** confirmed new leads appeared in `target/` within the expected delay window with zero DLQ accumulation
+
+
+
 ---
 
 ## 🧩 Key Design Decisions
@@ -117,7 +131,9 @@ This wasn't a "build it and demo it once" project. Over the 7-day continuous run
 - **Deterministic S3 keys for idempotency** — `crm_event_{lead_id}.json` and `calendly_invitee_created_{booking_id}.json` mean webhook redelivery is a safe overwrite, not a duplicate.
 - **Per-source signature verification, not a shared helper** — Close and Calendly sign webhooks differently (`Close-Sig-Hash`/`Close-Sig-Timestamp` headers vs. Calendly's combined `t=...,v1=...` header), so each receiver implements its own verification rather than forcing a common abstraction that would obscure the actual scheme being checked.
 - **Event-type filtering at the Calendly receiver** — a single Calendly webhook subscription can fire multiple event types (`invitee.created`, `invitee.canceled`, etc.); the receiver explicitly no-ops on anything except `invitee.created` so the Bronze layer only ever contains bookings, not cancellations.
-- **DynamoDB watermark over re-scanning S3** — single-digit-millisecond reads to check "have I already processed this Wistia update" beat scanning prior Bronze files on every run.
+- **DynamoDB watermark over re-scanning S3** — single-digit-millisecond reads to check "have I already processed this Wistia update" beat scanning prior Bronze files on every run; media stats and visitor events keep separate watermark keys so one feed's failure never stalls the other.
+- **A conditional write is the notification gate, not a "check then send"** — Lambda C claims the notification flag with `attribute_not_exists(lead_id)` in a single atomic operation. A read-then-write check would leave a race window where two concurrent S3 events both pass the check and both post to Slack.
+- **Tests exercise pure logic with zero AWS calls** — the suite loads the Lambda modules by file path (avoiding the module-name collision between the two `lambda_webhook_receiver.py` files), sets env vars before import, and verifies both HMAC schemes, key determinism, and watermark comparisons — so `pytest` runs green in GitHub Actions with no credentials.
 - **Date-level join for cross-source correlation, not a forced row-level key** — CRM, Calendly, and Wistia have no natural shared ID. Rather than invent one, the cross-source dashboard correlates at the daily aggregate level and states that assumption explicitly.
 
 ---
@@ -128,16 +144,22 @@ This wasn't a "build it and demo it once" project. Over the 7-day continuous run
 insightflow-project/
 ├── README.md
 ├── .github/workflows/{ci.yml, deploy.yml}
-├── architecture/ (one diagram per flow + 1 consolidated)
+├── architecture/ (one diagram per flow + 1 consolidated, SME approvals)
 ├── crm/
 │   ├── lambda_webhook_receiver.py
 │   ├── lambda_enrich_lead.py
-│   └── lambda_notify_slack.py
+│   ├── lambda_notify_slack.py
+│   └── sqs_delay_queue.tf
 ├── calendly/
 │   ├── lambda_webhook_receiver.py
 │   ├── bronze_to_silver_bookings.py
 │   ├── ingest_spend_data.py
 │   └── build_gold_cpb.py
-├── wistia/extract_stats.py
-└── dashboard/app.py
+├── wistia/
+│   ├── extract_stats.py               # media stats + visitor events
+│   ├── bronze_to_silver_wistia.py
+│   └── silver_to_gold_engagement.py
+├── cross_source/build_daily_gold.py
+├── dashboard/app.py
+└── tests/test_pipeline_logic.py
 ```
